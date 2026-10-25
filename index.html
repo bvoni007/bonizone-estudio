@@ -73,7 +73,6 @@ const stamp = () => { const d = new Date(), p = n => String(n).padStart(2, '0');
 
 function pickMime() {
   const opts = [
-    'video/mp4;codecs=avc3.640028,mp4a.40.2',
     'video/mp4;codecs=avc1.640028,mp4a.40.2',
     'video/mp4',
     'video/webm;codecs=vp9,opus',
@@ -297,8 +296,21 @@ async function host() {
     if (recording) {
       const s = Math.floor((Date.now() - t0) / 1000);
       $('#badge').textContent = `● REC ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+      drawGuestRaw();
     }
   }
+  // Quadro fixo 1920x1080 só do convidado: a resolução dele oscila com a internet,
+  // e o MP4 padrão (que abre no QuickTime) não aceita mudança de resolução no meio
+  const gcv = document.createElement('canvas'); gcv.width = W; gcv.height = H;
+  const gctx = gcv.getContext('2d');
+  function drawGuestRaw() {
+    gctx.fillStyle = '#000'; gctx.fillRect(0, 0, W, H);
+    if (!vGuest.videoWidth) return;
+    const k = Math.min(W / vGuest.videoWidth, H / vGuest.videoHeight);
+    const w = vGuest.videoWidth * k, h = vGuest.videoHeight * k;
+    gctx.drawImage(vGuest, (W - w) / 2, (H - h) / 2, w, h);
+  }
+  const guestCanvasStream = gcv.captureStream(FPS);
   makeTicker(FPS, draw);
   const canvasStream = cv.captureStream(FPS);
 
@@ -382,7 +394,8 @@ async function host() {
   function startGuestRaw() {
     if (!guestStream) return;
     guestRecs++;
-    const r = new Recorder(guestStream, `${sessionName}_convidado${guestRecs > 1 ? '_parte' + guestRecs : ''}`, dir, 10_000_000);
+    const raw = new MediaStream([...guestCanvasStream.getVideoTracks(), ...guestStream.getAudioTracks()]);
+    const r = new Recorder(raw, `${sessionName}_convidado${guestRecs > 1 ? '_parte' + guestRecs : ''}`, dir, 10_000_000);
     recs.push(r); r.start();
   }
   async function startRec() {
