@@ -83,9 +83,27 @@ function pickMime() {
   return opts.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
 }
 
-async function getCam() {
-  return navigator.mediaDevices.getUserMedia(CAM);
+async function getCam(camId, micId) {
+  const c = {
+    video: camId ? { ...CAM.video, deviceId:{ exact:camId } } : CAM.video,
+    audio: micId ? { ...CAM.audio, deviceId:{ exact:micId } } : CAM.audio,
+  };
+  try { return await navigator.mediaDevices.getUserMedia(c); }
+  catch (e) { if (camId || micId) return navigator.mediaDevices.getUserMedia(CAM); throw e; }
 }
+
+// Preenche os seletores de câmera/mic (iPhone aparece como câmera de continuidade)
+async function fillDevices(camSel, micSel, stream) {
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  const curCam = stream.getVideoTracks()[0]?.getSettings().deviceId;
+  const curMic = stream.getAudioTracks()[0]?.getSettings().deviceId;
+  const opt = (d, cur, i, kind) => `<option value="${d.deviceId}" ${d.deviceId === cur ? 'selected' : ''}>${d.label || kind + ' ' + (i + 1)}</option>`;
+  camSel.innerHTML = devs.filter(d => d.kind === 'videoinput').map((d, i) => opt(d, curCam, i, 'Câmera')).join('');
+  micSel.innerHTML = devs.filter(d => d.kind === 'audioinput').map((d, i) => opt(d, curMic, i, 'Microfone')).join('');
+}
+
+function savedDevice(key) { try { return localStorage.getItem(key) || ''; } catch { return ''; } }
+function saveDevice(key, v) { try { localStorage.setItem(key, v); } catch {} }
 
 // Sobe o bitrate e prioriza resolução nos envios de vídeo
 async function tuneSenders(pc) {
@@ -173,6 +191,8 @@ async function host() {
         <option value="solo-guest">Só convidado</option>
       </select>
       <button id="mic">🎙️ Mic ligado</button>
+      <select id="camSel" title="Câmera"></select>
+      <select id="micSel" title="Microfone"></select>
       <label class="muted"><input type="checkbox" id="names" checked> Nomes na tela</label>
       <label class="muted"><input type="checkbox" id="autostop" checked> Parar quando o convidado sair</label>
     </div>
@@ -194,7 +214,7 @@ async function host() {
       <p class="muted" id="net">Conectando ao servidor…</p>
     </div>
     <div class="card" id="filesCard" style="display:none"><b>Gravações</b><ul class="files" id="files"></ul></div>
-    <video id="vHost" autoplay playsinline muted style="display:none"></video>
+    <video id="vHost" autoplay playsinline muted style="position:absolute;width:1px;height:1px;opacity:0"></video>
     <video id="vGuest" autoplay playsinline style="position:absolute;width:1px;height:1px;opacity:0"></video>
   `;
   const cv = $('#cv'), ctx = cv.getContext('2d');
@@ -203,13 +223,41 @@ async function host() {
   const guestUrl = () => `${location.origin}${location.pathname}?sala=${roomId}`;
   link.value = guestUrl();
 
-  const local = await getCam();
-  vHost.srcObject = local;
-  vHost.onloadedmetadata = () => $('#resHost').textContent = resLabel(vHost);
+  let local = await getCam(savedDevice('bz_cam'), savedDevice('bz_mic'));
+  vHost.srcObject = local; vHost.play().catch(() => {});
+  setInterval(() => $('#resHost').textContent = resLabel(vHost), 1000);
+  await fillDevices($('#camSel'), $('#micSel'), local);
+
+  // Troca câmera/mic ao vivo (inclusive no meio da chamada)
+  async function switchDevice() {
+    const camId = $('#camSel').value, micId = $('#micSel').value;
+    saveDevice('bz_cam', camId); saveDevice('bz_mic', micId);
+    const next = await getCam(camId, micId);
+    const old = local; local = next;
+    vHost.srcObject = local; vHost.play().catch(() => {});
+    if (currentCall && currentCall.peerConnection) {
+      for (const s of currentCall.peerConnection.getSenders()) {
+        const t = s.track && local.getTracks().find(x => x.kind === s.track.kind);
+        if (t) await s.replaceTrack(t);
+      }
+      tuneSenders(currentCall.peerConnection);
+    }
+    if (audioCtx) {
+      if (localAudioNode) try { localAudioNode.disconnect(); } catch {}
+      localAudioNode = audioCtx.createMediaStreamSource(local);
+      localAudioNode.connect(mixDest);
+    }
+    const micOn = old.getAudioTracks()[0]?.enabled !== false;
+    local.getAudioTracks().forEach(t => t.enabled = micOn);
+    old.getTracks().forEach(t => t.stop());
+  }
+  $('#camSel').onchange = switchDevice;
+  $('#micSel').onchange = switchDevice;
+  navigator.mediaDevices.addEventListener('devicechange', () => fillDevices($('#camSel'), $('#micSel'), local));
 
   let guestStream = null, guestName = 'Convidado', currentCall = null;
   let dir = null, recording = false, recs = [], guestRecs = 0, t0 = 0, sessionName = '';
-  let audioCtx = null, mixDest = null, guestAudioNode = null;
+  let audioCtx = null, mixDest = null, guestAudioNode = null, localAudioNode = null;
 
   // --- Desenho do quadro ---
   function drawCover(v, x, y, w, h) {
@@ -259,7 +307,7 @@ async function host() {
     if (audioCtx) return;
     audioCtx = new AudioContext({ sampleRate:48000 });
     mixDest = audioCtx.createMediaStreamDestination();
-    audioCtx.createMediaStreamSource(local).connect(mixDest);
+    localAudioNode = audioCtx.createMediaStreamSource(local); localAudioNode.connect(mixDest);
     if (guestStream) connectGuestAudio();
   }
   function connectGuestAudio() {
@@ -270,14 +318,23 @@ async function host() {
   }
 
   // --- Conexão ---
-  const peer = new Peer(roomId, { config:ICE });
-  peer.on('open', () => $('#net').textContent = 'Sala aberta. Mande o link para o convidado.');
-  peer.on('error', e => {
-    $('#net').textContent = e.type === 'unavailable-id'
-      ? 'Esta sala já está aberta em outra aba. Feche a outra ou clique em "Nova sala".'
-      : 'Erro de conexão: ' + e.type;
-  });
-  peer.on('disconnected', () => { try { peer.reconnect(); } catch {} });
+  // O servidor gratuito de sinalização às vezes cai: reabre a sala sozinho
+  let peer = null, retry = null;
+  function openRoom() {
+    clearTimeout(retry);
+    if (peer) try { peer.destroy(); } catch {}
+    peer = new Peer(roomId, { config:ICE });
+    peer.on('open', () => $('#net').textContent = 'Sala aberta. Mande o link para o convidado.');
+    peer.on('error', e => {
+      if (e.type === 'peer-unavailable') return;
+      $('#net').textContent = e.type === 'unavailable-id'
+        ? 'Reabrindo a sala… (se demorar, veja se o estúdio não está aberto em outra aba)'
+        : 'Conexão instável, reconectando…';
+      retry = setTimeout(openRoom, 4000);
+    });
+    peer.on('disconnected', () => { if (!peer.destroyed) try { peer.reconnect(); } catch { retry = setTimeout(openRoom, 4000); } });
+    peer.on('call', onCall);
+  }
 
   let leaveTimer = null;
   function guestLeft() {
@@ -290,7 +347,7 @@ async function host() {
     }
   }
 
-  peer.on('call', call => {
+  function onCall(call) {
     if (currentCall) try { currentCall.close(); } catch {}
     currentCall = call;
     guestName = (call.metadata && call.metadata.name) || 'Convidado';
@@ -307,9 +364,18 @@ async function host() {
     call.on('close', () => { if (currentCall === call) guestLeft(); });
     const pc = call.peerConnection;
     pc.addEventListener('connectionstatechange', () => {
-      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState) && currentCall === call) guestLeft();
+      if (currentCall !== call) return;
+      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) guestLeft();
+      // Internet do convidado voltou sozinha: retoma sem perder a gravação
+      else if (pc.connectionState === 'connected' && !guestStream && call.remoteStream) {
+        clearTimeout(leaveTimer);
+        guestStream = call.remoteStream; vGuest.srcObject = guestStream; vGuest.play().catch(() => {});
+        $('#dotGuest').classList.add('ok'); $('#net').textContent = `${guestName} voltou.`;
+        connectGuestAudio();
+      }
     });
-  });
+  }
+  openRoom();
   setInterval(() => { if (guestStream) $('#resGuest').textContent = `${guestName} · ${resLabel(vGuest)}`; }, 1000);
 
   // --- Gravação ---
@@ -329,11 +395,11 @@ async function host() {
     recs.push(main, mine);
     await Promise.all([main.start(), mine.start()]);
     startGuestRaw();
-    recording = true; t0 = Date.now();
+    recording = true; t0 = Date.now(); $('#camSel').disabled = $('#micSel').disabled = true;
     $('#badge').classList.add('on'); $('#rec').textContent = '■ Parar e salvar';
   }
   async function stopRec() {
-    recording = false; clearTimeout(leaveTimer);
+    recording = false; clearTimeout(leaveTimer); $('#camSel').disabled = $('#micSel').disabled = false;
     $('#badge').classList.remove('on'); $('#rec').textContent = '● Gravar'; $('#rec').disabled = true;
     const out = await Promise.all(recs.map(r => r.stop()));
     $('#rec').disabled = false;
@@ -394,22 +460,34 @@ function guest(roomId) {
       </div>
       <p class="muted" id="gstatus">Conectando…</p>`;
     $('#vMe').srcObject = local;
-    const peer = new Peer(undefined, { config:ICE });
-    let call = null;
+    // Tenta de novo sozinho se o anfitrião ainda não abriu a sala ou se a conexão cair
+    let peer = null, call = null, connected = false, left = false, retry = null;
+    const later = (fn, msg) => { if (left) return; $('#gstatus').textContent = msg; clearTimeout(retry); retry = setTimeout(fn, 4000); };
     const connect = () => {
+      if (left || connected) return;
       call = peer.call(roomId, local, { metadata:{ name } });
-      if (!call) return;
-      call.on('stream', s => { $('#vRemote').srcObject = s; $('#gstatus').textContent = 'Conectado. A conversa está sendo gravada pelo anfitrião.'; tuneSenders(call.peerConnection); });
-      call.on('close', () => $('#gstatus').textContent = 'Conversa encerrada.');
+      if (!call) return later(connect, 'Conectando…');
+      call.on('stream', s => { connected = true; $('#vRemote').srcObject = s; $('#gstatus').textContent = 'Conectado. A conversa está sendo gravada pelo anfitrião.'; tuneSenders(call.peerConnection); });
+      call.on('close', () => { connected = false; $('#gstatus').textContent = 'Conversa encerrada.'; });
     };
-    peer.on('open', connect);
-    peer.on('error', e => $('#gstatus').textContent = e.type === 'peer-unavailable' ? 'A sala ainda não está aberta. Aguarde o anfitrião e recarregue a página.' : 'Erro de conexão: ' + e.type);
+    const start = () => {
+      if (left) return;
+      if (peer) try { peer.destroy(); } catch {}
+      peer = new Peer(undefined, { config:ICE });
+      peer.on('open', connect);
+      peer.on('error', e => e.type === 'peer-unavailable'
+        ? later(connect, 'Aguardando o anfitrião abrir a sala…')
+        : later(start, 'Conexão instável, reconectando…'));
+    };
+    start();
     setInterval(() => $('#gres').textContent = `Sua câmera: ${resLabel($('#vMe'))}`, 1000);
     $('#gmic').onclick = () => { const t = local.getAudioTracks()[0]; t.enabled = !t.enabled; $('#gmic').textContent = t.enabled ? '🎙️ Mic ligado' : '🔇 Mic mudo'; };
     $('#gcam').onclick = () => { const t = local.getVideoTracks()[0]; t.enabled = !t.enabled; $('#gcam').textContent = t.enabled ? '📷 Câmera ligada' : '🚫 Câmera desligada'; };
     $('#leave').onclick = () => {
+      left = true; clearTimeout(retry);
       try { call && call.close(); } catch {}
-      peer.destroy(); local.getTracks().forEach(t => t.stop());
+      try { peer.destroy(); } catch {}
+      local.getTracks().forEach(t => t.stop());
       app.innerHTML = `<div id="join" class="card"><h2>Obrigado!</h2><p class="muted">Você saiu da conversa. Já pode fechar esta aba.</p></div>`;
     };
   };
