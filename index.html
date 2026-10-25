@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BONIZONE Estúdio</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<style>
+  :root { --bg:#0b0d10; --panel:#14171c; --line:#252a31; --text:#eef1f4; --muted:#8a939e; --accent:#ff3b30; --ok:#30d158; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 -apple-system, BlinkMacSystemFont, "Inter", sans-serif; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:14px 20px; border-bottom:1px solid var(--line); }
+  .brand { font-weight:800; letter-spacing:.08em; }
+  .brand span { color:var(--accent); }
+  main { max-width:1280px; margin:0 auto; padding:20px 16px; }
+  .stage { position:relative; width:100%; aspect-ratio:16/9; background:#000; border-radius:12px; overflow:hidden; border:1px solid var(--line); }
+  .stage canvas, .stage video { width:100%; height:100%; display:block; object-fit:cover; }
+  .rec-badge { position:absolute; top:14px; left:14px; background:var(--accent); color:#fff; font-weight:700; padding:6px 12px; border-radius:6px; display:none; }
+  .rec-badge.on { display:block; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:16px; }
+  button, select, input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 14px; }
+  button { cursor:pointer; font-weight:600; }
+  button:hover { border-color:#3a414b; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  input { min-width:0; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:16px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .link { flex:1 1 320px; font-family:ui-monospace, Menlo, monospace; font-size:13px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .status { display:flex; gap:18px; flex-wrap:wrap; margin-top:10px; font-size:13px; color:var(--muted); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#555; margin-right:6px; }
+  .dot.ok { background:var(--ok); }
+  .guest-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .guest-grid .stage { aspect-ratio:16/9; }
+  .tag { position:absolute; left:10px; bottom:10px; background:rgba(0,0,0,.6); padding:4px 10px; border-radius:6px; font-size:13px; }
+  #join { max-width:460px; margin:60px auto; text-align:center; }
+  #join input { width:100%; margin:14px 0; }
+  ul.files { margin:8px 0 0; padding-left:18px; font-size:13px; }
+  ul.files a { color:var(--text); }
+  @media (max-width:720px) { .guest-grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">BONI<span>ZONE</span> ESTÚDIO</div>
+  <div class="muted" id="who"></div>
+</header>
+<main id="app"></main>
+
+<script>
+// ---------- Configuração ----------
+const ICE = { iceServers: [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+]};
+const CAM = {
+  video: { width:{ ideal:1920 }, height:{ ideal:1080 }, frameRate:{ ideal:30 } },
+  audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true },
+};
+const FPS = 30;
+const W = 1920, H = 1080;
+const VIDEO_BITRATE = 8_000_000;   // envio pela chamada
+const REC_BITRATE = 14_000_000;    // gravação final
+
+const params = new URLSearchParams(location.search);
+const roomFromUrl = params.get('sala');
+const app = document.getElementById('app');
+
+const $ = (sel, el=document) => el.querySelector(sel);
+const stamp = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}h${p(d.getMinutes())}`; };
+
+function pickMime() {
+  const opts = [
+    'video/mp4;codecs=avc3.640028,mp4a.40.2',
+    'video/mp4;codecs=avc1.640028,mp4a.40.2',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  return opts.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+}
+
+async function getCam() {
+  return navigator.mediaDevices.getUserMedia(CAM);
+}
+
+// Sobe o bitrate e prioriza resolução nos envios de vídeo
+async function tuneSenders(pc) {
+  for (const s of pc.getSenders()) {
+    if (!s.track || s.track.kind !== 'video') continue;
+    try {
+      const p = s.getParameters();
+      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      p.encodings[0].maxBitrate = VIDEO_BITRATE;
+      p.encodings[0].maxFramerate = FPS;
+      p.degradationPreference = 'maintain-resolution';
+      await s.setParameters(p);
+    } catch (e) { console.warn('setParameters', e); }
+  }
+}
+
+function resLabel(video) {
+  return video && video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : '—';
+}
+
+// ---------- Gravador: grava um stream em disco (pasta escolhida) ou em memória ----------
+class Recorder {
+  constructor(stream, name, dir, bitrate) {
+    this.name = name; this.dir = dir; this.mime = pickMime();
+    this.ext = this.mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+    this.filename = `${name}.${this.ext}`;
+    this.chunks = []; this.queue = Promise.resolve(); this.writable = null;
+    this.rec = new MediaRecorder(stream, { mimeType:this.mime, videoBitsPerSecond:bitrate, audioBitsPerSecond:192000 });
+    this.rec.ondataavailable = e => {
+      if (!e.data || !e.data.size) return;
+      if (this.writable) this.queue = this.queue.then(() => this.writable.write(e.data));
+      else this.chunks.push(e.data);
+    };
+  }
+  async start() {
+    if (this.dir) {
+      const fh = await this.dir.getFileHandle(this.filename, { create:true });
+      this.writable = await fh.createWritable();
+    }
+    this.rec.start(1000);
+  }
+  stop() {
+    return new Promise(resolve => {
+      this.rec.onstop = async () => {
+        await this.queue;
+        if (this.writable) { await this.writable.close(); resolve({ name:this.filename, saved:true }); }
+        else {
+          const url = URL.createObjectURL(new Blob(this.chunks, { type:this.mime }));
+          const a = document.createElement('a'); a.href = url; a.download = this.filename; a.click();
+          resolve({ name:this.filename, url });
+        }
+      };
+      if (this.rec.state !== 'inactive') this.rec.stop(); else this.rec.onstop();
+    });
+  }
+}
+
+// Timer em Worker: não é congelado quando a aba perde o foco
+function makeTicker(fps, fn) {
+  const src = `setInterval(()=>postMessage(0), ${Math.round(1000/fps)});`;
+  const w = new Worker(URL.createObjectURL(new Blob([src], { type:'text/javascript' })));
+  w.onmessage = fn;
+  return w;
+}
+
+// ============================================================
+// ANFITRIÃO (você)
+// ============================================================
+async function host() {
+  let roomId = null;
+  try { roomId = localStorage.getItem('bz_room'); } catch {}
+  if (!roomId) { roomId = 'bonizone-' + Math.random().toString(36).slice(2, 10); try { localStorage.setItem('bz_room', roomId); } catch {} }
+  let hostName = 'Lucas Bonini';
+  try { hostName = localStorage.getItem('bz_name') || hostName; } catch {}
+
+  app.innerHTML = `
+    <div class="stage"><canvas id="cv" width="${W}" height="${H}"></canvas><div class="rec-badge" id="badge">● REC 00:00</div></div>
+    <div class="bar">
+      <button class="primary" id="rec">● Gravar</button>
+      <button id="folder">📁 Pasta de gravação</button>
+      <select id="layout">
+        <option value="split">Lado a lado (preenchido)</option>
+        <option value="boxes">Lado a lado (16:9)</option>
+        <option value="solo-host">Só você</option>
+        <option value="solo-guest">Só convidado</option>
+      </select>
+      <button id="mic">🎙️ Mic ligado</button>
+      <label class="muted"><input type="checkbox" id="names" checked> Nomes na tela</label>
+      <label class="muted"><input type="checkbox" id="autostop" checked> Parar quando o convidado sair</label>
+    </div>
+    <div class="status">
+      <span><span class="dot ok"></span>Você: <b id="resHost">—</b></span>
+      <span><span class="dot" id="dotGuest"></span>Convidado: <b id="resGuest">aguardando</b></span>
+      <span id="folderLabel">Pasta: nenhuma (vai baixar ao final)</span>
+    </div>
+    <div class="card">
+      <div class="row">
+        <input class="link" id="link" readonly>
+        <button id="copy">Copiar link do convidado</button>
+        <button id="newroom">Nova sala</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <span class="muted">Seu nome na tela:</span>
+        <input id="hostName" value="${hostName}">
+      </div>
+      <p class="muted" id="net">Conectando ao servidor…</p>
+    </div>
+    <div class="card" id="filesCard" style="display:none"><b>Gravações</b><ul class="files" id="files"></ul></div>
+    <video id="vHost" autoplay playsinline muted style="display:none"></video>
+    <video id="vGuest" autoplay playsinline style="position:absolute;width:1px;height:1px;opacity:0"></video>
+  `;
+  const cv = $('#cv'), ctx = cv.getContext('2d');
+  const vHost = $('#vHost'), vGuest = $('#vGuest');
+  const link = $('#link');
+  const guestUrl = () => `${location.origin}${location.pathname}?sala=${roomId}`;
+  link.value = guestUrl();
+
+  const local = await getCam();
+  vHost.srcObject = local;
+  vHost.onloadedmetadata = () => $('#resHost').textContent = resLabel(vHost);
+
+  let guestStream = null, guestName = 'Convidado', currentCall = null;
+  let dir = null, recording = false, recs = [], guestRecs = 0, t0 = 0, sessionName = '';
+  let audioCtx = null, mixDest = null, guestAudioNode = null;
+
+  // --- Desenho do quadro ---
+  function drawCover(v, x, y, w, h) {
+    if (!v || !v.videoWidth) { ctx.fillStyle = '#15181d'; ctx.fillRect(x, y, w, h); return; }
+    const vr = v.videoWidth / v.videoHeight, r = w / h;
+    let sw = v.videoWidth, sh = v.videoHeight, sx = 0, sy = 0;
+    if (vr > r) { sw = sh * r; sx = (v.videoWidth - sw) / 2; } else { sh = sw / r; sy = (v.videoHeight - sh) / 2; }
+    ctx.drawImage(v, sx, sy, sw, sh, x, y, w, h);
+  }
+  function nameTag(text, x, y) {
+    if (!$('#names').checked || !text) return;
+    ctx.font = '600 30px -apple-system, Inter, sans-serif';
+    const pad = 16, tw = ctx.measureText(text).width;
+    ctx.fillStyle = 'rgba(0,0,0,.62)'; ctx.fillRect(x, y - 50, tw + pad * 2, 50);
+    ctx.fillStyle = '#ff3b30'; ctx.fillRect(x, y - 50, 6, 50);
+    ctx.fillStyle = '#fff'; ctx.fillText(text, x + pad, y - 15);
+  }
+  function draw() {
+    ctx.fillStyle = '#0b0d10'; ctx.fillRect(0, 0, W, H);
+    const hasGuest = guestStream && vGuest.videoWidth;
+    let layout = $('#layout').value;
+    if (!hasGuest && layout !== 'solo-host') layout = 'solo-host';
+    const hn = $('#hostName').value;
+    if (layout === 'split') {
+      const g = 12, w = (W - g * 3) / 2, h = H - g * 2;
+      drawCover(vHost, g, g, w, h); drawCover(vGuest, g * 2 + w, g, w, h);
+      nameTag(hn, g + 24, H - g - 24); nameTag(guestName, g * 2 + w + 24, H - g - 24);
+    } else if (layout === 'boxes') {
+      const g = 24, w = (W - g * 3) / 2, h = w * 9 / 16, y = (H - h) / 2;
+      drawCover(vHost, g, y, w, h); drawCover(vGuest, g * 2 + w, y, w, h);
+      nameTag(hn, g + 20, y + h - 20); nameTag(guestName, g * 2 + w + 20, y + h - 20);
+    } else if (layout === 'solo-guest') {
+      drawCover(vGuest, 0, 0, W, H); nameTag(guestName, 40, H - 40);
+    } else {
+      drawCover(vHost, 0, 0, W, H); nameTag(hn, 40, H - 40);
+    }
+    if (recording) {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      $('#badge').textContent = `● REC ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    }
+  }
+  makeTicker(FPS, draw);
+  const canvasStream = cv.captureStream(FPS);
+
+  // --- Áudio: mistura seu mic + convidado numa faixa só ---
+  function ensureAudio() {
+    if (audioCtx) return;
+    audioCtx = new AudioContext({ sampleRate:48000 });
+    mixDest = audioCtx.createMediaStreamDestination();
+    audioCtx.createMediaStreamSource(local).connect(mixDest);
+    if (guestStream) connectGuestAudio();
+  }
+  function connectGuestAudio() {
+    if (!audioCtx || !guestStream || !guestStream.getAudioTracks().length) return;
+    if (guestAudioNode) try { guestAudioNode.disconnect(); } catch {}
+    guestAudioNode = audioCtx.createMediaStreamSource(guestStream);
+    guestAudioNode.connect(mixDest);
+  }
+
+  // --- Conexão ---
+  const peer = new Peer(roomId, { config:ICE });
+  peer.on('open', () => $('#net').textContent = 'Sala aberta. Mande o link para o convidado.');
+  peer.on('error', e => {
+    $('#net').textContent = e.type === 'unavailable-id'
+      ? 'Esta sala já está aberta em outra aba. Feche a outra ou clique em "Nova sala".'
+      : 'Erro de conexão: ' + e.type;
+  });
+  peer.on('disconnected', () => { try { peer.reconnect(); } catch {} });
+
+  let leaveTimer = null;
+  function guestLeft() {
+    guestStream = null; vGuest.srcObject = null;
+    $('#dotGuest').classList.remove('ok'); $('#resGuest').textContent = 'saiu';
+    if (recording && $('#autostop').checked) {
+      clearTimeout(leaveTimer);
+      $('#net').textContent = 'Convidado saiu. A gravação para em 8s se ele não voltar…';
+      leaveTimer = setTimeout(() => { if (!guestStream && recording) stopRec(); }, 8000);
+    }
+  }
+
+  peer.on('call', call => {
+    if (currentCall) try { currentCall.close(); } catch {}
+    currentCall = call;
+    guestName = (call.metadata && call.metadata.name) || 'Convidado';
+    call.answer(local);
+    call.on('stream', s => {
+      clearTimeout(leaveTimer);
+      guestStream = s; vGuest.srcObject = s; vGuest.play().catch(() => {});
+      $('#dotGuest').classList.add('ok');
+      $('#net').textContent = `${guestName} entrou na sala.`;
+      connectGuestAudio();
+      tuneSenders(call.peerConnection);
+      if (recording) startGuestRaw();
+    });
+    call.on('close', () => { if (currentCall === call) guestLeft(); });
+    const pc = call.peerConnection;
+    pc.addEventListener('connectionstatechange', () => {
+      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState) && currentCall === call) guestLeft();
+    });
+  });
+  setInterval(() => { if (guestStream) $('#resGuest').textContent = `${guestName} · ${resLabel(vGuest)}`; }, 1000);
+
+  // --- Gravação ---
+  function startGuestRaw() {
+    if (!guestStream) return;
+    guestRecs++;
+    const r = new Recorder(guestStream, `${sessionName}_convidado${guestRecs > 1 ? '_parte' + guestRecs : ''}`, dir, 10_000_000);
+    recs.push(r); r.start();
+  }
+  async function startRec() {
+    ensureAudio();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    sessionName = `BONIZONE_conversa_${stamp()}`; recs = []; guestRecs = 0;
+    const mixed = new MediaStream([...canvasStream.getVideoTracks(), ...mixDest.stream.getAudioTracks()]);
+    const main = new Recorder(mixed, `${sessionName}_LADO-A-LADO`, dir, REC_BITRATE);
+    const mine = new Recorder(local, `${sessionName}_voce`, dir, 12_000_000);
+    recs.push(main, mine);
+    await Promise.all([main.start(), mine.start()]);
+    startGuestRaw();
+    recording = true; t0 = Date.now();
+    $('#badge').classList.add('on'); $('#rec').textContent = '■ Parar e salvar';
+  }
+  async function stopRec() {
+    recording = false; clearTimeout(leaveTimer);
+    $('#badge').classList.remove('on'); $('#rec').textContent = '● Gravar'; $('#rec').disabled = true;
+    const out = await Promise.all(recs.map(r => r.stop()));
+    $('#rec').disabled = false;
+    $('#filesCard').style.display = 'block';
+    for (const f of out) {
+      const li = document.createElement('li');
+      li.innerHTML = f.saved ? `✅ ${f.name} (salvo na pasta)` : `✅ <a href="${f.url}" download="${f.name}">${f.name}</a>`;
+      $('#files').appendChild(li);
+    }
+    $('#net').textContent = 'Gravação salva.';
+  }
+
+  // --- Botões ---
+  $('#rec').onclick = () => recording ? stopRec() : startRec();
+  $('#folder').onclick = async () => {
+    if (!window.showDirectoryPicker) { alert('Use o Google Chrome para escolher a pasta.'); return; }
+    try { dir = await window.showDirectoryPicker({ mode:'readwrite', id:'bz-rec' }); $('#folderLabel').textContent = 'Pasta: ' + dir.name + ' (grava direto no disco)'; } catch {}
+  };
+  $('#mic').onclick = () => {
+    const t = local.getAudioTracks()[0]; t.enabled = !t.enabled;
+    $('#mic').textContent = t.enabled ? '🎙️ Mic ligado' : '🔇 Mic mudo';
+  };
+  $('#copy').onclick = () => { navigator.clipboard.writeText(link.value); $('#copy').textContent = 'Copiado ✓'; setTimeout(() => $('#copy').textContent = 'Copiar link do convidado', 1500); };
+  $('#newroom').onclick = () => { try { localStorage.removeItem('bz_room'); } catch {} location.reload(); };
+  $('#hostName').oninput = e => { try { localStorage.setItem('bz_name', e.target.value); } catch {} };
+  window.addEventListener('beforeunload', e => { if (recording) { e.preventDefault(); e.returnValue = ''; } });
+  $('#who').textContent = 'Anfitrião';
+}
+
+// ============================================================
+// CONVIDADO
+// ============================================================
+function guest(roomId) {
+  $('#who').textContent = 'Convidado';
+  app.innerHTML = `
+    <div id="join" class="card">
+      <h2 style="margin:0 0 6px">Você foi convidado para uma conversa</h2>
+      <p class="muted">Use o Google Chrome e, se puder, fone de ouvido.</p>
+      <input id="gname" placeholder="Seu nome">
+      <button class="primary" id="enter" style="width:100%">Entrar na conversa</button>
+      <p class="muted" id="gstatus"></p>
+    </div>`;
+  $('#enter').onclick = async () => {
+    const name = $('#gname').value.trim() || 'Convidado';
+    $('#enter').disabled = true; $('#gstatus').textContent = 'Liberando câmera e microfone…';
+    let local;
+    try { local = await getCam(); } catch { $('#gstatus').textContent = 'Não consegui acessar a câmera. Libere a permissão no navegador e tente de novo.'; $('#enter').disabled = false; return; }
+    app.innerHTML = `
+      <div class="guest-grid">
+        <div class="stage"><video id="vRemote" autoplay playsinline></video><div class="tag">Anfitrião</div></div>
+        <div class="stage"><video id="vMe" autoplay playsinline muted style="transform:scaleX(-1)"></video><div class="tag">${name.replace(/</g, '')} (você)</div></div>
+      </div>
+      <div class="bar">
+        <button id="gmic">🎙️ Mic ligado</button>
+        <button id="gcam">📷 Câmera ligada</button>
+        <button class="primary" id="leave">Sair da conversa</button>
+        <span class="muted" id="gres"></span>
+      </div>
+      <p class="muted" id="gstatus">Conectando…</p>`;
+    $('#vMe').srcObject = local;
+    const peer = new Peer(undefined, { config:ICE });
+    let call = null;
+    const connect = () => {
+      call = peer.call(roomId, local, { metadata:{ name } });
+      if (!call) return;
+      call.on('stream', s => { $('#vRemote').srcObject = s; $('#gstatus').textContent = 'Conectado. A conversa está sendo gravada pelo anfitrião.'; tuneSenders(call.peerConnection); });
+      call.on('close', () => $('#gstatus').textContent = 'Conversa encerrada.');
+    };
+    peer.on('open', connect);
+    peer.on('error', e => $('#gstatus').textContent = e.type === 'peer-unavailable' ? 'A sala ainda não está aberta. Aguarde o anfitrião e recarregue a página.' : 'Erro de conexão: ' + e.type);
+    setInterval(() => $('#gres').textContent = `Sua câmera: ${resLabel($('#vMe'))}`, 1000);
+    $('#gmic').onclick = () => { const t = local.getAudioTracks()[0]; t.enabled = !t.enabled; $('#gmic').textContent = t.enabled ? '🎙️ Mic ligado' : '🔇 Mic mudo'; };
+    $('#gcam').onclick = () => { const t = local.getVideoTracks()[0]; t.enabled = !t.enabled; $('#gcam').textContent = t.enabled ? '📷 Câmera ligada' : '🚫 Câmera desligada'; };
+    $('#leave').onclick = () => {
+      try { call && call.close(); } catch {}
+      peer.destroy(); local.getTracks().forEach(t => t.stop());
+      app.innerHTML = `<div id="join" class="card"><h2>Obrigado!</h2><p class="muted">Você saiu da conversa. Já pode fechar esta aba.</p></div>`;
+    };
+  };
+}
+
+roomFromUrl ? guest(roomFromUrl) : host().catch(e => {
+  app.innerHTML = `<div id="join" class="card"><h2>Câmera bloqueada</h2><p class="muted">${e.message}. Libere câmera e microfone no Chrome e recarregue.</p></div>`;
+});
+</script>
+</body>
+</html>
